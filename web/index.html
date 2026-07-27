@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LocShare — live location</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #map { position: absolute; inset: 0; }
+  .card {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    background: #fff; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,.25);
+    padding: 10px 16px; z-index: 10; min-width: 220px; max-width: calc(100vw - 32px);
+  }
+  .card h1 { margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+  .card .sub { margin-top: 2px; font-size: 13px; color: #555; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #bbb; flex: none; }
+  .dot.live { background: #34a853; }
+  #recenter {
+    position: absolute; right: 12px; bottom: 28px; z-index: 10; display: none;
+    width: 48px; height: 48px; border-radius: 50%; border: none; cursor: pointer;
+    background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,.3); font-size: 22px;
+  }
+  #overlay {
+    position: absolute; inset: 0; z-index: 20; display: flex; align-items: center;
+    justify-content: center; background: #f5f5f5; text-align: center; padding: 24px;
+  }
+  #overlay .msg h2 { margin: 0 0 8px; font-size: 20px; }
+  #overlay .msg p { margin: 0; color: #555; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="card hidden" id="card">
+  <h1><span class="dot" id="livedot"></span><span id="name"></span></h1>
+  <div class="sub" id="status">Connecting…</div>
+  <div class="sub" id="expiry"></div>
+</div>
+<button id="recenter" title="Re-center">◎</button>
+<div id="overlay"><div class="msg" id="overlay-msg"><h2>Connecting…</h2><p></p></div></div>
+
+<script type="module">
+// Filled in at deploy time (see README).
+const firebaseConfig = {
+  apiKey: "REPLACE_ME_API_KEY",
+  projectId: "REPLACE_ME_PROJECT_ID",
+  appId: "REPLACE_ME_WEB_APP_ID",
+  databaseURL: "https://REPLACE_ME_PROJECT_ID-default-rtdb.firebaseio.com",
+};
+
+const VIEW_WIDTH_METERS = 30;
+const M_PER_DEG_LAT = 111320;
+const DOT_COLOR = "#4285F4";
+const STYLE_URL = "https://tiles.openfreemap.org/styles/liberty";
+
+const $ = (id) => document.getElementById(id);
+let serverTimeOffset = 0;
+
+function showOverlay(title, text) {
+  $("overlay-msg").innerHTML = "";
+  const h = document.createElement("h2"); h.textContent = title;
+  const p = document.createElement("p"); p.textContent = text || "";
+  $("overlay-msg").append(h, p);
+  $("overlay").classList.remove("hidden");
+}
+function hideOverlay() { $("overlay").classList.add("hidden"); }
+
+const params = new URLSearchParams(location.search);
+const token = (location.pathname.match(/\/s\/([A-Za-z0-9_-]+)/) || [])[1] || params.get("s");
+const demo = params.has("demo");
+
+if (demo) {
+  startViewer(demoSource);
+} else if (!token) {
+  showOverlay("LocShare", "Open a share link (…/s/…) to view a live location.");
+} else if (firebaseConfig.apiKey.startsWith("REPLACE_ME")) {
+  showOverlay("Not configured", "This deployment is missing its Firebase config.");
+} else {
+  startViewer(firebaseSource);
+}
+
+async function firebaseSource(onData, onError) {
+  const { initializeApp } = await import("https://www.gstatic.com/firebasejs/12.16.0/firebase-app.js");
+  const { getDatabase, ref, onValue } =
+    await import("https://www.gstatic.com/firebasejs/12.16.0/firebase-database.js");
+  const app = initializeApp(firebaseConfig);
+  const db = getDatabase(app);
+  onValue(ref(db, ".info/serverTimeOffset"), (snap) => { serverTimeOffset = snap.val() || 0; });
+  onValue(ref(db, `shares/${token}`), (snap) => onData(snap.val()), onError);
+}
+
+// Local preview without Firebase: index.html?demo
+function demoSource(onData) {
+  let lat = 40.75797, lng = -73.98554;
+  const mk = () => ({
+    name: "Demo walk",
+    expiresAt: Date.now() + 3600_000,
+    loc: { lat, lng, acc: 4 + Math.random() * 3, ts: Date.now() },
+  });
+  onData(mk());
+  setInterval(() => {
+    lat += (Math.random() - 0.4) * 2e-5;
+    lng += (Math.random() - 0.5) * 2e-5;
+    onData(mk());
+  }, 5000);
+}
+
+function metersPerDegLng(lat) { return M_PER_DEG_LAT * Math.cos(lat * Math.PI / 180); }
+
+function circlePolygon(lat, lng, radiusMeters, points = 64) {
+  const dLat = radiusMeters / M_PER_DEG_LAT;
+  const dLng = radiusMeters / metersPerDegLng(lat);
+  const ring = [];
+  for (let i = 0; i <= points; i++) {
+    const a = 2 * Math.PI * i / points;
+    ring.push([lng + dLng * Math.cos(a), lat + dLat * Math.sin(a)]);
+  }
+  return { type: "Polygon", coordinates: [ring] };
+}
+
+function boundsAround(lat, lng) {
+  const halfLng = (VIEW_WIDTH_METERS / 2) / metersPerDegLng(lat);
+  const halfLat = 1 / M_PER_DEG_LAT;
+  return [[lng - halfLng, lat - halfLat], [lng + halfLng, lat + halfLat]];
+}
+
+function fmtRemaining(ms) {
+  const t = Math.floor(ms / 1000);
+  const d = Math.floor(t / 86400), h = Math.floor((t % 86400) / 3600),
+        m = Math.floor((t % 3600) / 60), s = t % 60;
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function fmtAgo(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s} s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} min ago`;
+  return `${Math.floor(m / 60)} h ago`;
+}
+
+function startViewer(source) {
+  const map = new maplibregl.Map({
+    container: "map",
+    style: STYLE_URL,
+    center: [0, 0],
+    zoom: 1,
+    attributionControl: { compact: true },
+  });
+  map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-left");
+  map.touchZoomRotate.disableRotation();
+  map.dragRotate.disable();
+
+  let styleReady = false;
+  let firstFix = true;
+  let follow = true;
+  let share = null;   // latest share node
+  let ended = false;
+
+  map.on("load", () => {
+    map.addSource("acc", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+    map.addSource("dot", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+    map.addLayer({ id: "accuracy-fill", type: "fill", source: "acc",
+      paint: { "fill-color": DOT_COLOR, "fill-opacity": 0.12 } });
+    map.addLayer({ id: "accuracy-line", type: "line", source: "acc",
+      paint: { "line-color": DOT_COLOR, "line-opacity": 0.4, "line-width": 1 } });
+    map.addLayer({ id: "dot-halo", type: "circle", source: "dot",
+      paint: { "circle-radius": 9, "circle-color": "#FFFFFF" } });
+    map.addLayer({ id: "dot-core", type: "circle", source: "dot",
+      paint: { "circle-radius": 6, "circle-color": DOT_COLOR } });
+    styleReady = true;
+    render();
+  });
+
+  map.on("dragstart", () => {
+    follow = false;
+    $("recenter").style.display = "block";
+  });
+
+  $("recenter").addEventListener("click", () => {
+    follow = true;
+    $("recenter").style.display = "none";
+    if (share && share.loc) {
+      map.fitBounds(boundsAround(share.loc.lat, share.loc.lng), { padding: 0, duration: 600 });
+    }
+  });
+
+  source(
+    (val) => {
+      if (ended) return;
+      if (!val) { end("This share has ended", "The person sharing stopped, or the link is invalid."); return; }
+      share = val;
+      $("card").classList.remove("hidden");
+      $("name").textContent = val.name || "Live location";
+      render();
+    },
+    () => end("This share has ended", "It may have expired or the link is invalid."),
+  );
+
+  function end(title, text) {
+    ended = true;
+    $("card").classList.add("hidden");
+    showOverlay(title, text);
+  }
+
+  function render() {
+    if (ended || !share || !styleReady) return;
+    const loc = share.loc;
+    if (!loc) {
+      $("status").textContent = "Waiting for the first location fix…";
+      hideOverlay();
+      return;
+    }
+    map.getSource("dot").setData({ type: "Feature", properties: {},
+      geometry: { type: "Point", coordinates: [loc.lng, loc.lat] } });
+    map.getSource("acc").setData({ type: "Feature", properties: {},
+      geometry: circlePolygon(loc.lat, loc.lng, loc.acc || 0) });
+    if (firstFix) {
+      firstFix = false;
+      map.fitBounds(boundsAround(loc.lat, loc.lng), { padding: 0, duration: 0 });
+      hideOverlay();
+    } else if (follow) {
+      map.easeTo({ center: [loc.lng, loc.lat], duration: 500 });
+    }
+    tick();
+  }
+
+  function tick() {
+    if (ended || !share) return;
+    const now = Date.now() + serverTimeOffset;
+    if (share.loc && share.loc.ts) {
+      const age = now - share.loc.ts;
+      $("status").textContent =
+        `Updated ${fmtAgo(age)} · ±${Math.round(share.loc.acc || 0)} m`;
+      $("livedot").classList.toggle("live", age < 15000);
+    }
+    if (share.expiresAt === 0) {
+      $("expiry").textContent = "Shared until stopped";
+    } else if (share.expiresAt) {
+      const left = share.expiresAt - now;
+      if (left <= 0) {
+        end("This share has ended", "The sharing period is over.");
+        return;
+      }
+      $("expiry").textContent = `Ends in ${fmtRemaining(left)}`;
+    }
+  }
+
+  setInterval(tick, 1000);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "shares": {
+      "$token": {
+        ".read": "data.child('expiresAt').val() === 0 || data.child('expiresAt').val() > now",
+        ".write": "auth != null && ((!data.exists() && newData.child('owner').val() === auth.uid) || (data.exists() && data.child('owner').val() === auth.uid))"
+      }
+    }
+  }
+}
