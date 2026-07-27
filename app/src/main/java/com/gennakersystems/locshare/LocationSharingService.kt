@@ -80,8 +80,12 @@ class LocationSharingService : Service() {
                 val t = intent.getStringExtra(EXTRA_TOKEN)
                 val name = intent.getStringExtra(EXTRA_NAME) ?: ""
                 val expiresAt = intent.getLongExtra(EXTRA_EXPIRES_AT, 0L)
-                if (t == null || (expiresAt != 0L && expiresAt <= System.currentTimeMillis())) {
+                if (t == null) {
                     stopSharing(deleteShare = false)
+                } else if (expiresAt != 0L && expiresAt <= System.currentTimeMillis()) {
+                    // Redelivered after the share already lapsed — reclaim the node.
+                    token = t
+                    stopSharing(deleteShare = true)
                 } else {
                     startSharing(t, name, expiresAt)
                 }
@@ -109,7 +113,7 @@ class LocationSharingService : Service() {
         fused.requestLocationUpdates(request, callback, Looper.getMainLooper())
 
         if (expiresAt != 0L) {
-            handler.postDelayed({ stopSharing(deleteShare = false) }, expiresAt - System.currentTimeMillis())
+            handler.postDelayed({ stopSharing(deleteShare = true) }, expiresAt - System.currentTimeMillis())
         }
     }
 
@@ -118,7 +122,10 @@ class LocationSharingService : Service() {
         fused.removeLocationUpdates(callback)
         val t = token
         if (deleteShare && t != null) {
+            // Keep the token in OwnedShares until the delete lands, so a failure
+            // here is retried by ShareCleanup.sweep() on the next launch.
             FirebaseDatabase.getInstance().getReference("shares/$t").removeValue()
+                .addOnSuccessListener { OwnedShares.remove(this, t) }
         }
         token = null
         ShareState.set(this, null)

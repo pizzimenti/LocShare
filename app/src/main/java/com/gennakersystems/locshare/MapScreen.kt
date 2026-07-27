@@ -382,6 +382,7 @@ private suspend fun startShare(
         )
     }
     FirebaseDatabase.getInstance().getReference("shares/$token").setValue(data).await()
+    OwnedShares.add(context, token, expiresAt)
 
     val share = ActiveShare(token, name, expiresAt)
     ShareState.set(context, share)

@@ -24,6 +24,25 @@ showing the same map, dot, and accuracy circle, updated every 5 seconds.
   enforced server-side via `now`); only the creating anonymous user may **write**.
 - Stopping a share deletes its node; viewers see "share ended".
 
+## Expired-share cleanup
+
+Only the creating anonymous user may delete a share, and scheduled Cloud
+Functions need the paid Blaze plan — so the owning device is the only party that
+can reclaim its own nodes. Cleanup therefore happens client-side, in three
+places:
+
+1. The foreground service deletes the node when the duration elapses while it is
+   running (`LocationSharingService`).
+2. If the process died before expiry, `ShareCleanup.sweep()` deletes it on the
+   next app launch. Tokens are tracked in `OwnedShares` until the delete lands,
+   so a failed or offline delete is retried next launch.
+3. A redelivered start intent for an already-lapsed share reclaims the node
+   rather than resuming it.
+
+Not covered: shares orphaned by uninstalling the app, and "forever" shares
+(`expiresAt = 0`), which by definition never lapse. Both need either a manual
+delete in the console or an upgrade to Blaze for a scheduled sweep.
+
 ## One-time Firebase setup
 
 1. `npx firebase-tools login`
