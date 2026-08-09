@@ -54,6 +54,7 @@ class LocationSharingService : Service() {
     }
 
     private var token: String? = null
+    private var shareExpiresAt = 0L
     private val handler = Handler(Looper.getMainLooper())
     private val fused by lazy { LocationServices.getFusedLocationProviderClient(this) }
 
@@ -61,6 +62,12 @@ class LocationSharingService : Service() {
         override fun onLocationResult(result: LocationResult) {
             val loc = result.lastLocation ?: return
             val t = token ?: return
+            // The postDelayed expiry timer is uptime-based and stalls in Doze,
+            // so enforce expiry against the wall clock on every update too.
+            if (shareExpiresAt != 0L && System.currentTimeMillis() >= shareExpiresAt) {
+                stopSharing(deleteShare = true)
+                return
+            }
             FirebaseDatabase.getInstance().getReference("shares/$t/loc").setValue(
                 mapOf(
                     "lat" to loc.latitude,
@@ -83,9 +90,16 @@ class LocationSharingService : Service() {
                 if (t == null) {
                     stopSharing(deleteShare = false)
                 } else if (expiresAt != 0L && expiresAt <= System.currentTimeMillis()) {
-                    // Redelivered after the share already lapsed — reclaim the node.
-                    token = t
-                    stopSharing(deleteShare = true)
+                    // Redelivered after the share already lapsed. Reclaim that
+                    // node, but don't tear down a newer share that replaced it.
+                    val active = ShareState.active.value
+                    if (active == null || active.token == t) {
+                        token = t
+                        stopSharing(deleteShare = true)
+                    } else {
+                        OwnedShares.markPendingDelete(this, t)
+                        stopSelf()
+                    }
                 } else {
                     startSharing(t, name, expiresAt)
                 }
@@ -98,6 +112,7 @@ class LocationSharingService : Service() {
     @SuppressLint("MissingPermission") // only started from UI after the permission grant
     private fun startSharing(t: String, name: String, expiresAt: Long) {
         token = t
+        shareExpiresAt = expiresAt
         handler.removeCallbacksAndMessages(null)
 
         val notification = buildNotification(name, expiresAt)
@@ -120,14 +135,20 @@ class LocationSharingService : Service() {
     private fun stopSharing(deleteShare: Boolean) {
         handler.removeCallbacksAndMessages(null)
         fused.removeLocationUpdates(callback)
-        val t = token
+        // A restarted service instance carries no token of its own, so fall back
+        // to the persisted share — otherwise Stop clears the UI without ever
+        // deleting the node.
+        val t = token ?: ShareState.active.value?.token
         if (deleteShare && t != null) {
-            // Keep the token in OwnedShares until the delete lands, so a failure
-            // here is retried by ShareCleanup.sweep() on the next launch.
+            // Mark before issuing the delete: if it never reaches the server
+            // (offline, or this process dies first) the next sweep retries it,
+            // including for "forever" shares that no expiry would ever catch.
+            OwnedShares.markPendingDelete(this, t)
             FirebaseDatabase.getInstance().getReference("shares/$t").removeValue()
                 .addOnSuccessListener { OwnedShares.remove(this, t) }
         }
         token = null
+        shareExpiresAt = 0L
         ShareState.set(this, null)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()

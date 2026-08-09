@@ -68,6 +68,7 @@ import com.google.android.gms.location.Priority
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.database.FirebaseDatabase
 import com.google.firebase.database.ServerValue
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
@@ -381,8 +382,23 @@ private suspend fun startShare(
             "ts" to ServerValue.TIMESTAMP,
         )
     }
-    FirebaseDatabase.getInstance().getReference("shares/$token").setValue(data).await()
+    // Register before the write. A node that reaches the server while this
+    // coroutine is cancelled (it lives in the composable's scope, so a rotation
+    // is enough) would otherwise be invisible to every cleanup path. Registering
+    // a token whose write never landed is harmless: deleting a node that does
+    // not exist succeeds.
     OwnedShares.add(context, token, expiresAt)
+    try {
+        FirebaseDatabase.getInstance().getReference("shares/$token").setValue(data).await()
+    } catch (e: CancellationException) {
+        // The write may still land, and the share was never handed to the user,
+        // so queue it for reclamation instead of leaving it live.
+        OwnedShares.markPendingDelete(context, token)
+        throw e
+    } catch (e: Exception) {
+        OwnedShares.remove(context, token)
+        throw e
+    }
 
     val share = ActiveShare(token, name, expiresAt)
     ShareState.set(context, share)

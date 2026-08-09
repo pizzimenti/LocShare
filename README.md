@@ -28,20 +28,39 @@ showing the same map, dot, and accuracy circle, updated every 5 seconds.
 
 Only the creating anonymous user may delete a share, and scheduled Cloud
 Functions need the paid Blaze plan — so the owning device is the only party that
-can reclaim its own nodes. Cleanup therefore happens client-side, in three
-places:
+can reclaim its own nodes. Cleanup therefore happens client-side.
 
-1. The foreground service deletes the node when the duration elapses while it is
-   running (`LocationSharingService`).
-2. If the process died before expiry, `ShareCleanup.sweep()` deletes it on the
-   next app launch. Tokens are tracked in `OwnedShares` until the delete lands,
-   so a failed or offline delete is retried next launch.
-3. A redelivered start intent for an already-lapsed share reclaims the node
-   rather than resuming it.
+`OwnedShares` (SharedPreferences) records every token this device creates as
+`"<expiresAt>|<attempts>"`, written **before** the node is created so a share
+that reaches the server while the caller is cancelled is still reclaimable. An
+entry is removed only once its delete is confirmed. `expiresAt` may be:
 
-Not covered: shares orphaned by uninstalling the app, and "forever" shares
-(`expiresAt = 0`), which by definition never lapse. Both need either a manual
-delete in the console or an upgrade to Blaze for a scheduled sweep.
+- a timestamp — reclaim once it has passed,
+- `0` — "forever", never reclaimed by expiry,
+- `-1` — *pending delete*: a delete was requested but not confirmed, so retry
+  regardless of expiry. This is what makes a failed Stop on a "forever" share
+  recoverable.
+
+Deletion is attempted from three places:
+
+1. `LocationSharingService` deletes the node when the duration elapses. Expiry
+   is checked on every location update against the wall clock, because the
+   `postDelayed` timer is uptime-based and stalls in Doze.
+2. `ShareCleanup.sweep()` runs on every foreground entry (`onStart`, not
+   `onCreate` — the service keeps the process alive, so warm launches would
+   otherwise never sweep). It runs on `Dispatchers.IO`, skips the token
+   currently being broadcast, and gives up on an entry after
+   `OwnedShares.MAX_ATTEMPTS` so an impossible delete isn't retried forever.
+3. A redelivered start intent for a lapsed share reclaims that node without
+   disturbing a newer share that replaced it.
+
+Expiry is judged against server-corrected time (`.info/serverTimeOffset`) plus a
+one-minute margin, since the server enforces expiry with its own clock and a
+fast device clock would otherwise delete shares that are still live.
+
+Not covered: shares orphaned by uninstalling the app, which drops the anonymous
+uid that owns them. Those need a manual delete in the console, or Blaze for a
+scheduled server-side sweep.
 
 ## One-time Firebase setup
 
