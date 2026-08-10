@@ -4,6 +4,8 @@ Minimal live location sharing: an Android app that shows your precise position o
 a ~30 m-wide map view and can share it via a web link. The link opens a web page
 showing the same map, dot, and accuracy circle, updated every 5 seconds.
 
+Released versions and the versioning policy are in [CHANGELOG.md](CHANGELOG.md).
+
 ## Stack
 
 - **Android**: Kotlin + Jetpack Compose, MapLibre Android SDK (OpenGL variant),
