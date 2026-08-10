@@ -11,8 +11,14 @@ object Geo {
     /** How wide (east-west, in meters) the map viewport is once a precise fix exists. */
     const val VIEW_WIDTH_METERS = 30.0
 
-    /** A fix is "precise" once its reported accuracy is at or below this radius. */
-    const val PRECISE_ACCURACY_METERS = 20f
+    /**
+     * A fix is "precise" once its reported accuracy is at or below this radius.
+     *
+     * Kept below a quarter of [VIEW_WIDTH_METERS] so the accuracy circle fits
+     * inside the viewport it triggers: at 20 m the circle was 40 m across and
+     * overflowed the 30 m view entirely, which made the zoom meaningless.
+     */
+    const val PRECISE_ACCURACY_METERS = 8f
 
     private const val M_PER_DEG_LAT = 111_320.0
 

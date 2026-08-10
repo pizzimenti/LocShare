@@ -97,8 +97,18 @@ class LocationSharingService : Service() {
                         token = t
                         stopSharing(deleteShare = true)
                     } else {
+                        // A newer share replaced this one. Queue the lapsed node
+                        // for the next sweep and leave the newer share alone —
+                        // stopSelf() here would stop the whole service, ending
+                        // the uploads for the share that is actually live.
                         OwnedShares.markPendingDelete(this, t)
-                        stopSelf()
+                        if (token == null) {
+                            // Cold instance: this stale intent was redelivered
+                            // into a process where nothing is broadcasting yet,
+                            // so resume the share the app still shows as live
+                            // rather than leaving it silently dead.
+                            startSharing(active.token, active.name, active.expiresAt)
+                        }
                     }
                 } else {
                     startSharing(t, name, expiresAt)

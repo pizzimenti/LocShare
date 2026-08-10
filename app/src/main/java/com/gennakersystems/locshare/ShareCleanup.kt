@@ -27,9 +27,10 @@ import kotlin.coroutines.resume
  * Stored as `"<expiresAt>|<attempts>"`:
  *  - `expiresAt` epoch millis, [FOREVER] for a share with no expiry, or
  *    [PENDING_DELETE] once a delete has been requested but not confirmed.
- *  - `attempts` counts consecutive failed deletes so a permanently impossible
- *    delete (e.g. the owning uid was lost) is eventually abandoned instead of
- *    retried on every launch forever.
+ *  - `attempts` counts deletes the server actively *refused*, so a permanently
+ *    impossible delete (e.g. the owning uid was lost) is eventually abandoned
+ *    instead of retried on every launch forever. Failures to reach the server
+ *    at all are deliberately not counted — see [recordRefusal].
  */
 object OwnedShares {
     private const val PREFS = "owned_shares"
@@ -56,26 +57,37 @@ object OwnedShares {
         else -> null
     }
 
-    private fun write(context: Context, token: String, entry: Entry) {
+    /**
+     * Writes synchronously and reports whether the write reached disk. `apply()`
+     * would return before it does, and a record that exists only in memory when
+     * the process dies leaves behind exactly the unreclaimable node this store
+     * is here to prevent. Callers keep this off the main thread where the
+     * calling context allows it.
+     */
+    private fun write(context: Context, token: String, entry: Entry): Boolean =
         prefs(context).edit()
             .putString(token, "${entry.expiresAt}|${entry.attempts}")
-            .apply()
-    }
+            .commit()
 
-    fun add(context: Context, token: String, expiresAt: Long) {
+    /** Records a token as owned. Returns false if the record did not persist. */
+    fun add(context: Context, token: String, expiresAt: Long): Boolean =
         write(context, token, Entry(expiresAt, 0))
-    }
 
     /**
      * Marks a token for deletion on the next sweep regardless of its expiry.
      * Used when a delete was requested but may not have reached the server —
      * without this, a failed stop on a [FOREVER] share would never be retried.
      */
-    fun markPendingDelete(context: Context, token: String) {
+    fun markPendingDelete(context: Context, token: String): Boolean {
         val attempts = parse(prefs(context).all[token])?.attempts ?: 0
-        write(context, token, Entry(PENDING_DELETE, attempts))
+        return write(context, token, Entry(PENDING_DELETE, attempts))
     }
 
+    /**
+     * Forgets a token whose node is confirmed gone. Unlike [write] this may be
+     * asynchronous: losing the removal only costs one redundant delete on the
+     * next sweep, and deleting an absent node succeeds.
+     */
     fun remove(context: Context, token: String) {
         prefs(context).edit().remove(token).apply()
     }
@@ -101,15 +113,24 @@ object OwnedShares {
             if (pending || lapsed) token else null
         }
 
-    /** Records a failed delete; drops the entry once [MAX_ATTEMPTS] is reached. */
-    fun recordFailure(context: Context, token: String) {
+    /**
+     * Records a delete the server actively refused.
+     *
+     * Only refusals count toward [MAX_ATTEMPTS]. A timeout means the request
+     * never got an answer — usually just an offline device — and treating that
+     * as progress toward giving up would discard the only local record of a node
+     * that is still live and still readable. Those are retried indefinitely,
+     * which costs one request per foreground entry.
+     *
+     * The entry is kept even once the cap is reached: [due] stops offering it,
+     * but the record remains the only evidence the orphaned node exists.
+     */
+    fun recordRefusal(context: Context, token: String) {
         val entry = parse(prefs(context).all[token]) ?: return
         val next = entry.copy(attempts = entry.attempts + 1)
+        write(context, token, next)
         if (next.attempts >= MAX_ATTEMPTS) {
-            Log.w(TAG, "giving up on $token after ${next.attempts} attempts; node may be orphaned")
-            remove(context, token)
-        } else {
-            write(context, token, next)
+            Log.w(TAG, "$token refused $MAX_ATTEMPTS times; node is orphaned and will not be retried")
         }
     }
 }
@@ -126,8 +147,9 @@ object ShareCleanup {
      * Deletes this device's shares that have lapsed or been explicitly stopped.
      *
      * Safe to call on every foreground entry: it returns immediately when nothing
-     * is due. Runs entirely off the main thread. Failures are left in
-     * [OwnedShares] to retry, up to [OwnedShares.MAX_ATTEMPTS].
+     * is due. Runs entirely off the main thread. Entries survive failure and are
+     * retried on the next sweep; only a node the server refuses to delete is
+     * eventually abandoned, after [OwnedShares.MAX_ATTEMPTS] refusals.
      */
     suspend fun sweep(context: Context) = withContext(Dispatchers.IO) {
         if (!Config.isConfigured) return@withContext
@@ -161,27 +183,51 @@ object ShareCleanup {
         }
 
         for (token in due) {
-            try {
-                // An RTDB write Task only completes on server ack, so without a
+            val error = try {
+                // An RTDB write only completes on server ack, so without a
                 // timeout this suspends indefinitely while offline.
-                withTimeout(DELETE_TIMEOUT_MS) {
-                    db.getReference("shares/$token").removeValue().await()
-                }
-                OwnedShares.remove(context, token)
-                Log.i(TAG, "reclaimed share $token")
+                withTimeout(DELETE_TIMEOUT_MS) { removeShare(db, token) }
             } catch (e: TimeoutCancellationException) {
-                Log.w(TAG, "timed out reclaiming $token; will retry", e)
-                OwnedShares.recordFailure(context, token)
+                // No answer from the server: the node may well still be there,
+                // so keep the entry untouched and try again next time.
+                Log.w(TAG, "timed out reclaiming $token; will retry")
+                continue
             } catch (e: CancellationException) {
                 // The caller's scope was cancelled — leave the entry for the
                 // next sweep and honour the cancellation.
                 throw e
-            } catch (e: Exception) {
-                Log.w(TAG, "could not reclaim $token; will retry", e)
-                OwnedShares.recordFailure(context, token)
+            }
+
+            when {
+                error == null -> {
+                    OwnedShares.remove(context, token)
+                    Log.i(TAG, "reclaimed share $token")
+                }
+                // The server answered and said no. Retrying cannot help: this
+                // device no longer holds the uid that owns the node.
+                error.code == DatabaseError.PERMISSION_DENIED -> {
+                    Log.w(TAG, "delete of $token refused: ${error.message}")
+                    OwnedShares.recordRefusal(context, token)
+                }
+                else -> Log.w(TAG, "could not reclaim $token; will retry: ${error.message}")
             }
         }
     }
+
+    /**
+     * Deletes a share node, returning null on success or the server's error.
+     *
+     * Uses the completion listener rather than awaiting the Task so that a
+     * refusal can be told apart from never having reached the server at all —
+     * the two demand opposite responses, and the Task surfaces both as an
+     * exception.
+     */
+    private suspend fun removeShare(db: FirebaseDatabase, token: String): DatabaseError? =
+        suspendCancellableCoroutine { cont ->
+            db.getReference("shares/$token").removeValue { error, _ ->
+                if (cont.isActive) cont.resume(error)
+            }
+        }
 
     /**
      * Difference between server and device clocks, from the SDK's locally cached

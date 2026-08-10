@@ -22,6 +22,8 @@ showing the same map, dot, and accuracy circle, updated every 5 seconds.
   (unguessable URL).
 - Database rules: anyone with the token may **read** until `expiresAt` (0 = forever,
   enforced server-side via `now`); only the creating anonymous user may **write**.
+  Deleting a node that is already absent is a permitted no-op, so a repeated
+  delete succeeds instead of being refused — see the cleanup section.
 - Stopping a share deletes its node; viewers see "share ended".
 
 ## Expired-share cleanup
@@ -48,9 +50,16 @@ Deletion is attempted from three places:
    `postDelayed` timer is uptime-based and stalls in Doze.
 2. `ShareCleanup.sweep()` runs on every foreground entry (`onStart`, not
    `onCreate` — the service keeps the process alive, so warm launches would
-   otherwise never sweep). It runs on `Dispatchers.IO`, skips the token
-   currently being broadcast, and gives up on an entry after
-   `OwnedShares.MAX_ATTEMPTS` so an impossible delete isn't retried forever.
+   otherwise never sweep). It runs on `Dispatchers.IO` and skips the token
+   currently being broadcast.
+
+   A failed delete keeps its entry. Only a delete the server actively *refuses*
+   counts toward `OwnedShares.MAX_ATTEMPTS`; a timeout means the request never
+   got an answer, and abandoning the record then would discard the only handle
+   on a node that is still live. That distinction is why the sweep uses the
+   completion listener rather than awaiting the write Task — the Task reports
+   "refused" and "never reached the server" identically, and the two call for
+   opposite responses.
 3. A redelivered start intent for a lapsed share reclaims that node without
    disturbing a newer share that replaced it.
 
@@ -83,7 +92,10 @@ scheduled server-side sweep.
 
 - The 30 m viewport: camera fits a bounds whose east-west span is 30 m
   (`Geo.boundsAround` / `boundsAround` in the web viewer) once a fix with
-  accuracy ≤ 20 m arrives.
+  accuracy ≤ 8 m arrives, or after 20 s with whatever accuracy is available —
+  indoors a fix may never get that good, and a map parked wide open is worse
+  than one zoomed in on a coarse fix. The gate is below a quarter of the view
+  width so the accuracy circle fits inside the viewport it triggers.
 - The app UI runs its own 1 s location stream for display; the 5 s upload stream
   lives in `LocationSharingService` and survives backgrounding (persistent
   notification with a Stop action).
