@@ -12,6 +12,27 @@ Notable changes to LocShare, newest first. Format follows
 - This changelog, and a documented versioning policy. Landed after the `v0.2.0`
   tag was cut, so it is not in that tag.
 
+## [0.2.1] — 2026-08-09
+
+### Fixed
+
+- The map settled at roughly 200 m across instead of 30 m. Locking the camera
+  flipped `locked` before the bounds animation had finished, so the next
+  location update took the follow-mode branch and eased to the new centre —
+  which cancels an animation in flight and leaves the camera at whatever zoom
+  it had reached. The 30 m view, the premise of the app, was only correct if no
+  fix arrived during those 800 ms. `locked` now flips when the animation
+  finishes, and follow-mode holds off while a fit is in flight.
+
+  Found on a Pixel 10 Pro; it did not reproduce on the emulator, where a
+  synthetic fix satisfied the accuracy gate immediately.
+
+### Added
+
+- The fitted viewport width is measured from the map's own projection and
+  logged. Nothing on screen distinguishes a 30 m view from a 200 m one, which
+  is why the bug above survived to a release.
+
 ## [0.2.0] — 2026-08-09
 
 Expired and stopped shares are now reclaimed. Before this release nothing ever
@@ -131,6 +152,7 @@ Releases are cut from `main` after the pull request merges:
 Published tags are never moved or deleted; a mistake in a release is corrected
 by the next one.
 
-[Unreleased]: https://github.com/pizzimenti/LocShare/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/pizzimenti/LocShare/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/pizzimenti/LocShare/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/pizzimenti/LocShare/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/pizzimenti/LocShare/releases/tag/v0.1.0
