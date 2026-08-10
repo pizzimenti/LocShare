@@ -40,6 +40,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -52,6 +54,15 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // Sweeping from onCreate alone would miss warm launches: this activity is
+        // singleTask and the foreground service keeps the process alive for the
+        // whole share, so returning to the app usually routes through
+        // onNewIntent. The sweep returns immediately when nothing is due.
+        lifecycleScope.launch { ShareCleanup.sweep(this@MainActivity) }
     }
 }
 

@@ -54,6 +54,7 @@ class LocationSharingService : Service() {
     }
 
     private var token: String? = null
+    private var shareExpiresAt = 0L
     private val handler = Handler(Looper.getMainLooper())
     private val fused by lazy { LocationServices.getFusedLocationProviderClient(this) }
 
@@ -61,6 +62,12 @@ class LocationSharingService : Service() {
         override fun onLocationResult(result: LocationResult) {
             val loc = result.lastLocation ?: return
             val t = token ?: return
+            // The postDelayed expiry timer is uptime-based and stalls in Doze,
+            // so enforce expiry against the wall clock on every update too.
+            if (shareExpiresAt != 0L && System.currentTimeMillis() >= shareExpiresAt) {
+                stopSharing(deleteShare = true)
+                return
+            }
             FirebaseDatabase.getInstance().getReference("shares/$t/loc").setValue(
                 mapOf(
                     "lat" to loc.latitude,
@@ -80,8 +87,29 @@ class LocationSharingService : Service() {
                 val t = intent.getStringExtra(EXTRA_TOKEN)
                 val name = intent.getStringExtra(EXTRA_NAME) ?: ""
                 val expiresAt = intent.getLongExtra(EXTRA_EXPIRES_AT, 0L)
-                if (t == null || (expiresAt != 0L && expiresAt <= System.currentTimeMillis())) {
+                if (t == null) {
                     stopSharing(deleteShare = false)
+                } else if (expiresAt != 0L && expiresAt <= System.currentTimeMillis()) {
+                    // Redelivered after the share already lapsed. Reclaim that
+                    // node, but don't tear down a newer share that replaced it.
+                    val active = ShareState.active.value
+                    if (active == null || active.token == t) {
+                        token = t
+                        stopSharing(deleteShare = true)
+                    } else {
+                        // A newer share replaced this one. Queue the lapsed node
+                        // for the next sweep and leave the newer share alone —
+                        // stopSelf() here would stop the whole service, ending
+                        // the uploads for the share that is actually live.
+                        OwnedShares.markPendingDelete(this, t)
+                        if (token == null) {
+                            // Cold instance: this stale intent was redelivered
+                            // into a process where nothing is broadcasting yet,
+                            // so resume the share the app still shows as live
+                            // rather than leaving it silently dead.
+                            startSharing(active.token, active.name, active.expiresAt)
+                        }
+                    }
                 } else {
                     startSharing(t, name, expiresAt)
                 }
@@ -94,6 +122,7 @@ class LocationSharingService : Service() {
     @SuppressLint("MissingPermission") // only started from UI after the permission grant
     private fun startSharing(t: String, name: String, expiresAt: Long) {
         token = t
+        shareExpiresAt = expiresAt
         handler.removeCallbacksAndMessages(null)
 
         val notification = buildNotification(name, expiresAt)
@@ -109,18 +138,27 @@ class LocationSharingService : Service() {
         fused.requestLocationUpdates(request, callback, Looper.getMainLooper())
 
         if (expiresAt != 0L) {
-            handler.postDelayed({ stopSharing(deleteShare = false) }, expiresAt - System.currentTimeMillis())
+            handler.postDelayed({ stopSharing(deleteShare = true) }, expiresAt - System.currentTimeMillis())
         }
     }
 
     private fun stopSharing(deleteShare: Boolean) {
         handler.removeCallbacksAndMessages(null)
         fused.removeLocationUpdates(callback)
-        val t = token
+        // A restarted service instance carries no token of its own, so fall back
+        // to the persisted share — otherwise Stop clears the UI without ever
+        // deleting the node.
+        val t = token ?: ShareState.active.value?.token
         if (deleteShare && t != null) {
+            // Mark before issuing the delete: if it never reaches the server
+            // (offline, or this process dies first) the next sweep retries it,
+            // including for "forever" shares that no expiry would ever catch.
+            OwnedShares.markPendingDelete(this, t)
             FirebaseDatabase.getInstance().getReference("shares/$t").removeValue()
+                .addOnSuccessListener { OwnedShares.remove(this, t) }
         }
         token = null
+        shareExpiresAt = 0L
         ShareState.set(this, null)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()

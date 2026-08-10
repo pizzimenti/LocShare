@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.location.Location
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Base64
 import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
@@ -68,9 +69,12 @@ import com.google.android.gms.location.Priority
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.database.FirebaseDatabase
 import com.google.firebase.database.ServerValue
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
 import org.maplibre.android.MapLibre
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
@@ -96,6 +100,9 @@ private const val STYLE_URL = "https://tiles.openfreemap.org/styles/liberty"
 private const val SRC_DOT = "me-dot"
 private const val SRC_ACC = "me-accuracy"
 private const val DOT_COLOR = "#4285F4"
+
+/** How long to hold out for a precise fix before zooming in on a coarse one. */
+private const val PRECISION_WAIT_MS = 20_000L
 
 private val DURATION_CHOICES: List<Pair<Long, String>> = run {
     val m = 60_000L
@@ -127,6 +134,7 @@ fun MapScreen() {
     var location by remember { mutableStateOf<Location?>(null) }
     val follow = remember { mutableStateOf(true) }
     val locked = remember { mutableStateOf(false) } // true once zoomed to the 30 m viewport
+    val firstFixAt = remember { mutableStateOf<Long?>(null) }
     var map by remember { mutableStateOf<MapLibreMap?>(null) }
     var styleReady by remember { mutableStateOf(false) }
     var showShareDialog by remember { mutableStateOf(false) }
@@ -200,7 +208,13 @@ fun MapScreen() {
             style.getSourceAs<GeoJsonSource>(SRC_ACC)
                 ?.setGeoJson(Geo.circlePolygon(loc.latitude, loc.longitude, loc.accuracy.toDouble()))
 
-            if (!locked.value && loc.accuracy <= Geo.PRECISE_ACCURACY_METERS) {
+            if (firstFixAt.value == null) firstFixAt.value = SystemClock.elapsedRealtime()
+            // Indoors the fix may never get to 8 m. Zoom in anyway once we have
+            // waited long enough, rather than leaving the map parked wide open.
+            val waitedTooLong =
+                SystemClock.elapsedRealtime() - (firstFixAt.value ?: 0L) >= PRECISION_WAIT_MS
+
+            if (!locked.value && (loc.accuracy <= Geo.PRECISE_ACCURACY_METERS || waitedTooLong)) {
                 locked.value = true
                 follow.value = true
                 m.animateCamera(
@@ -381,7 +395,27 @@ private suspend fun startShare(
             "ts" to ServerValue.TIMESTAMP,
         )
     }
-    FirebaseDatabase.getInstance().getReference("shares/$token").setValue(data).await()
+    // Register before the write. A node that reaches the server while this
+    // coroutine is cancelled (it lives in the composable's scope, so a rotation
+    // is enough) would otherwise be invisible to every cleanup path. Registering
+    // a token whose write never landed is harmless: deleting a node that does
+    // not exist succeeds.
+    // The write is synchronous, so it goes to the IO dispatcher; if it fails
+    // there is no durable record of the token, and creating the node anyway
+    // would be creating one nothing can reclaim.
+    val registered = withContext(Dispatchers.IO) { OwnedShares.add(context, token, expiresAt) }
+    if (!registered) error("could not record share ownership")
+    try {
+        FirebaseDatabase.getInstance().getReference("shares/$token").setValue(data).await()
+    } catch (e: CancellationException) {
+        // The write may still land, and the share was never handed to the user,
+        // so queue it for reclamation instead of leaving it live.
+        OwnedShares.markPendingDelete(context, token)
+        throw e
+    } catch (e: Exception) {
+        OwnedShares.remove(context, token)
+        throw e
+    }
 
     val share = ActiveShare(token, name, expiresAt)
     ShareState.set(context, share)
