@@ -7,10 +7,27 @@ Notable changes to LocShare, newest first. Format follows
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.0] — 2026-08-10
+
 ### Added
 
-- This changelog, and a documented versioning policy. Landed after the `v0.2.0`
-  tag was cut, so it is not in that tag.
+- An opening descent. The map now starts on the whole globe and closes in on
+  the user through continent, state or province, and locality before fitting
+  the final view, instead of cutting straight to a 30 m box. Dropping someone
+  into 30 m of unlabelled ground gives them no way to tell where they are; the
+  descent answers that before it stops answering it.
+
+  The descent takes about nine seconds while the fix converges, and never less
+  than five even when the first fix is already precise — below that the
+  movement reads as a jump cut rather than a journey. It waits over the
+  locality until the fix is worth closing in on, then fits 30 m, then 10 m if
+  the fix can support it. Grabbing the map at any point ends it; the camera
+  stays where the user put it.
+
+- A 10 m view for fixes at or under ±3 m. Above that the closer view would
+  only be magnifying the uncertainty, so it is not offered.
 
 ## [0.2.1] — 2026-08-09
 
@@ -152,7 +169,8 @@ Releases are cut from `main` after the pull request merges:
 Published tags are never moved or deleted; a mistake in a release is corrected
 by the next one.
 
-[Unreleased]: https://github.com/pizzimenti/LocShare/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/pizzimenti/LocShare/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/pizzimenti/LocShare/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/pizzimenti/LocShare/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/pizzimenti/LocShare/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/pizzimenti/LocShare/releases/tag/v0.1.0

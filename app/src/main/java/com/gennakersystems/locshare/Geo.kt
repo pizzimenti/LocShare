@@ -12,6 +12,14 @@ object Geo {
     const val VIEW_WIDTH_METERS = 30.0
 
     /**
+     * A closer view still, used only when the fix is good enough to mean
+     * anything at this scale. Below [TIGHT_ACCURACY_METERS] the dot is honest
+     * at 10 m across; above it the view would just be magnifying uncertainty.
+     */
+    const val TIGHT_VIEW_WIDTH_METERS = 10.0
+    const val TIGHT_ACCURACY_METERS = 3f
+
+    /**
      * A fix is "precise" once its reported accuracy is at or below this radius.
      *
      * Kept below a quarter of [VIEW_WIDTH_METERS] so the accuracy circle fits

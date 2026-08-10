@@ -52,6 +52,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -74,10 +75,14 @@ import com.google.firebase.database.ServerValue
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import org.maplibre.android.MapLibre
+import org.maplibre.android.camera.CameraUpdate
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.maps.MapLibreMap
@@ -96,6 +101,7 @@ import org.maplibre.android.style.layers.PropertyFactory.lineWidth
 import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.geojson.Point
 import java.security.SecureRandom
+import kotlin.coroutines.resume
 import kotlin.math.roundToInt
 
 private const val STYLE_URL = "https://tiles.openfreemap.org/styles/liberty"
@@ -104,8 +110,41 @@ private const val SRC_ACC = "me-accuracy"
 private const val DOT_COLOR = "#4285F4"
 private const val TAG = "MapScreen"
 
-/** How long to hold out for a precise fix before zooming in on a coarse one. */
+/** How long to hold out for a precise fix before closing in on a coarse one. */
 private const val PRECISION_WAIT_MS = 20_000L
+
+/**
+ * The opening descent. The camera starts on the whole globe and closes in on
+ * the user, so the first thing they see places them in the world rather than
+ * dropping them into an unlabelled 30 m box with no way to tell where it is.
+ * Zoom levels are approximate: continent, then state or province, then the
+ * surrounding locality, before the final fit to a measured width.
+ */
+private const val ZOOM_WORLD = 0.0
+private const val ZOOM_CONTINENT = 3.2
+private const val ZOOM_REGION = 6.0
+private const val ZOOM_LOCALITY = 11.5
+
+/**
+ * Share of the descent budget each leg gets. They sum to 1, so the budget is
+ * the wall-clock length of the descent and [INTRO_MIN_MS] is a real floor
+ * rather than something that needs padding out afterwards.
+ */
+private val DESCENT_LEGS = listOf(
+    ZOOM_CONTINENT to 0.22,
+    ZOOM_REGION to 0.22,
+    ZOOM_LOCALITY to 0.26,
+)
+private const val FINAL_LEG_SHARE = 0.30
+
+/** The descent never runs faster than this, however good the first fix is. */
+private const val INTRO_MIN_MS = 5_000L
+
+/** ...and takes this long when it has to wait for the fix to converge. */
+private const val INTRO_RELAXED_MS = 9_000L
+
+/** The last step in, from 30 m to 10 m, when the fix can support it. */
+private const val TIGHT_LEG_MS = 1_400
 
 private val DURATION_CHOICES: List<Pair<Long, String>> = run {
     val m = 60_000L
@@ -138,7 +177,7 @@ fun MapScreen() {
     val follow = remember { mutableStateOf(true) }
     val locked = remember { mutableStateOf(false) } // true once zoomed to the 30 m viewport
     val fitting = remember { mutableStateOf(false) } // a bounds animation is in flight
-    val firstFixAt = remember { mutableStateOf<Long?>(null) }
+    val introStarted = remember { mutableStateOf(false) }
     var map by remember { mutableStateOf<MapLibreMap?>(null) }
     var styleReady by remember { mutableStateOf(false) }
     var showShareDialog by remember { mutableStateOf(false) }
@@ -160,16 +199,17 @@ fun MapScreen() {
 
     val mapView = rememberMapViewWithLifecycle()
 
-    // Fits the camera to the 30 m viewport. [locked] flips only once the
-    // animation has actually finished: the follow-mode ease below cancels a
-    // bounds animation in flight, and a cancelled animation leaves the camera
-    // at whatever zoom it had reached rather than at the one asked for.
+    // Fits the camera to the width the current fix can honestly support.
+    // [locked] flips only once the animation has actually finished: the
+    // follow-mode ease below cancels a bounds animation in flight, and a
+    // cancelled animation leaves the camera at whatever zoom it had reached
+    // rather than at the one asked for.
     val fitTo: (MapLibreMap, Location, Int) -> Unit = { m, loc, durationMs ->
         fitting.value = true
         follow.value = true
         m.animateCamera(
             CameraUpdateFactory.newLatLngBounds(
-                Geo.boundsAround(loc.latitude, loc.longitude), 0
+                Geo.boundsAround(loc.latitude, loc.longitude, targetWidthMeters(loc.accuracy)), 0
             ),
             durationMs,
             object : MapLibreMap.CancelableCallback {
@@ -188,6 +228,73 @@ fun MapScreen() {
                 }
             },
         )
+    }
+
+    // The opening descent: the globe, then continent, region, locality, and
+    // finally the fit. It owns the camera until it settles — follow-mode below
+    // waits for [locked], since easing to a new centre cancels a leg in flight.
+    LaunchedEffect(map, styleReady) {
+        val m = map ?: return@LaunchedEffect
+        if (!styleReady || introStarted.value) return@LaunchedEffect
+        introStarted.value = true
+
+        // Open on the globe, so the descent has somewhere to descend from
+        // rather than starting wherever the map happened to be.
+        m.moveCamera(CameraUpdateFactory.zoomTo(ZOOM_WORLD))
+
+        val first = snapshotFlow { location }.filterNotNull().first()
+        // A fix that is already precise earns a quicker descent, but never one
+        // so quick that it reads as a jump cut instead of a journey.
+        val budget =
+            if (first.accuracy <= Geo.PRECISE_ACCURACY_METERS) INTRO_MIN_MS else INTRO_RELAXED_MS
+        val holdUntil = SystemClock.elapsedRealtime() + PRECISION_WAIT_MS
+
+        for ((zoom, share) in DESCENT_LEGS) {
+            val here = location ?: first
+            val completed = m.animateTo(
+                CameraUpdateFactory.newLatLngZoom(LatLng(here.latitude, here.longitude), zoom),
+                (budget * share).toInt(),
+            )
+            // Cancelled means the user grabbed the map. Stop flying them around.
+            if (!completed) {
+                locked.value = true
+                return@LaunchedEffect
+            }
+        }
+
+        // Hold over the locality until the fix is worth closing in on, or until
+        // waiting has stopped being better than showing a coarse view.
+        while (SystemClock.elapsedRealtime() < holdUntil &&
+            (location?.accuracy ?: Float.MAX_VALUE) > Geo.PRECISE_ACCURACY_METERS
+        ) {
+            delay(200)
+        }
+
+        val near = location ?: first
+        var completed = m.animateTo(
+            CameraUpdateFactory.newLatLngBounds(
+                Geo.boundsAround(near.latitude, near.longitude, Geo.VIEW_WIDTH_METERS), 0
+            ),
+            (budget * FINAL_LEG_SHARE).toInt(),
+        )
+
+        // One step closer, but only where the fix can support it.
+        val tight = location ?: near
+        if (completed && tight.accuracy <= Geo.TIGHT_ACCURACY_METERS) {
+            completed = m.animateTo(
+                CameraUpdateFactory.newLatLngBounds(
+                    Geo.boundsAround(
+                        tight.latitude, tight.longitude, Geo.TIGHT_VIEW_WIDTH_METERS
+                    ),
+                    0,
+                ),
+                TIGHT_LEG_MS,
+            )
+        }
+
+        follow.value = true
+        locked.value = true
+        if (completed) logViewportWidth(m, mapView.width, mapView.height)
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -242,20 +349,11 @@ fun MapScreen() {
             style.getSourceAs<GeoJsonSource>(SRC_ACC)
                 ?.setGeoJson(Geo.circlePolygon(loc.latitude, loc.longitude, loc.accuracy.toDouble()))
 
-            if (firstFixAt.value == null) firstFixAt.value = SystemClock.elapsedRealtime()
-            // Indoors the fix may never get to 8 m. Zoom in anyway once we have
-            // waited long enough, rather than leaving the map parked wide open.
-            val waitedTooLong =
-                SystemClock.elapsedRealtime() - (firstFixAt.value ?: 0L) >= PRECISION_WAIT_MS
-
-            if (!locked.value && !fitting.value &&
-                (loc.accuracy <= Geo.PRECISE_ACCURACY_METERS || waitedTooLong)
-            ) {
-                fitTo(m, loc, 800)
-            } else if (locked.value && follow.value && !fitting.value) {
-                // Never while fitting: easing to a new centre cancels the bounds
-                // animation in flight and strands the camera at whatever zoom it
-                // had reached, which is how the 30 m viewport got lost.
+            // Camera work belongs to the descent until it settles. Never ease
+            // while a fit is in flight either: easing to a new centre cancels
+            // the animation and strands the camera at whatever zoom it had
+            // reached, which is how the 30 m viewport got lost once already.
+            if (locked.value && follow.value && !fitting.value) {
                 m.easeCamera(
                     CameraUpdateFactory.newLatLng(LatLng(loc.latitude, loc.longitude)), 500
                 )
@@ -394,6 +492,41 @@ private fun rememberMapViewWithLifecycle(): MapView {
     }
     return mapView
 }
+
+/**
+ * How wide a view this fix earns. A 10 m view of a ±20 m fix would just be
+ * magnifying the uncertainty, so the close view is reserved for fixes that can
+ * carry it.
+ */
+private fun targetWidthMeters(accuracy: Float): Double =
+    if (accuracy <= Geo.TIGHT_ACCURACY_METERS) {
+        Geo.TIGHT_VIEW_WIDTH_METERS
+    } else {
+        Geo.VIEW_WIDTH_METERS
+    }
+
+/**
+ * Runs a camera animation and suspends until it settles, reporting false when
+ * it was cancelled — which is how the user grabbing the map interrupts the
+ * descent. Turning the callback into a suspension is what lets the descent read
+ * as a sequence rather than a chain of nested callbacks.
+ */
+private suspend fun MapLibreMap.animateTo(update: CameraUpdate, durationMs: Int): Boolean =
+    suspendCancellableCoroutine { cont ->
+        animateCamera(
+            update,
+            durationMs,
+            object : MapLibreMap.CancelableCallback {
+                override fun onFinish() {
+                    if (cont.isActive) cont.resume(true)
+                }
+
+                override fun onCancel() {
+                    if (cont.isActive) cont.resume(false)
+                }
+            },
+        )
+    }
 
 /**
  * Reports how wide the viewport actually ended up, measured across the map's

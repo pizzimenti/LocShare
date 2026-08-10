@@ -93,11 +93,17 @@ scheduled server-side sweep.
 ## Development notes
 
 - The 30 m viewport: camera fits a bounds whose east-west span is 30 m
-  (`Geo.boundsAround` / `boundsAround` in the web viewer) once a fix with
-  accuracy ≤ 8 m arrives, or after 20 s with whatever accuracy is available —
-  indoors a fix may never get that good, and a map parked wide open is worse
-  than one zoomed in on a coarse fix. The gate is below a quarter of the view
-  width so the accuracy circle fits inside the viewport it triggers.
+  (`Geo.boundsAround` / `boundsAround` in the web viewer). The gate for a
+  "precise" fix is 8 m, below a quarter of the view width, so the accuracy
+  circle fits inside the viewport it triggers.
+- The app reaches that view through an opening descent — globe, continent,
+  region, locality, then the fit — which owns the camera until it settles.
+  Follow-mode must stay out of the way while any camera animation is in
+  flight: easing to a new centre cancels an animation, and a cancelled
+  animation leaves the camera at whatever zoom it had reached, not the one
+  requested. That is how the 30 m view was silently lost before 0.2.1.
+  Nothing on screen distinguishes 30 m from 200 m, so `logViewportWidth`
+  measures the settled width from the map's own projection.
 - The app UI runs its own 1 s location stream for display; the 5 s upload stream
   lives in `LocationSharingService` and survives backgrounding (persistent
   notification with a Stop action).
