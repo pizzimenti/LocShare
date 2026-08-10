@@ -7,7 +7,10 @@ Notable changes to LocShare, newest first. Format follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- This changelog, and a documented versioning policy. Landed after the `v0.2.0`
+  tag was cut, so it is not in that tag.
 
 ## [0.2.0] — 2026-08-09
 
@@ -27,7 +30,6 @@ stayed readable by anyone holding its link.
 - Pending-delete tracking, so a stop that never reached the server is retried.
   Without it a stopped "forever" share had no expiry to catch it and would stay
   live permanently.
-- A `CHANGELOG.md`, and a documented versioning policy.
 
 ### Changed
 
