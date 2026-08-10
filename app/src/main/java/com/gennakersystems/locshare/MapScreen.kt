@@ -6,7 +6,9 @@ import android.content.Intent
 import android.location.Location
 import android.os.Looper
 import android.os.SystemClock
+import android.graphics.PointF
 import android.util.Base64
+import android.util.Log
 import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -100,6 +102,7 @@ private const val STYLE_URL = "https://tiles.openfreemap.org/styles/liberty"
 private const val SRC_DOT = "me-dot"
 private const val SRC_ACC = "me-accuracy"
 private const val DOT_COLOR = "#4285F4"
+private const val TAG = "MapScreen"
 
 /** How long to hold out for a precise fix before zooming in on a coarse one. */
 private const val PRECISION_WAIT_MS = 20_000L
@@ -134,6 +137,7 @@ fun MapScreen() {
     var location by remember { mutableStateOf<Location?>(null) }
     val follow = remember { mutableStateOf(true) }
     val locked = remember { mutableStateOf(false) } // true once zoomed to the 30 m viewport
+    val fitting = remember { mutableStateOf(false) } // a bounds animation is in flight
     val firstFixAt = remember { mutableStateOf<Long?>(null) }
     var map by remember { mutableStateOf<MapLibreMap?>(null) }
     var styleReady by remember { mutableStateOf(false) }
@@ -155,6 +159,36 @@ fun MapScreen() {
     }
 
     val mapView = rememberMapViewWithLifecycle()
+
+    // Fits the camera to the 30 m viewport. [locked] flips only once the
+    // animation has actually finished: the follow-mode ease below cancels a
+    // bounds animation in flight, and a cancelled animation leaves the camera
+    // at whatever zoom it had reached rather than at the one asked for.
+    val fitTo: (MapLibreMap, Location, Int) -> Unit = { m, loc, durationMs ->
+        fitting.value = true
+        follow.value = true
+        m.animateCamera(
+            CameraUpdateFactory.newLatLngBounds(
+                Geo.boundsAround(loc.latitude, loc.longitude), 0
+            ),
+            durationMs,
+            object : MapLibreMap.CancelableCallback {
+                override fun onFinish() {
+                    fitting.value = false
+                    locked.value = true
+                    logViewportWidth(m, mapView.width, mapView.height)
+                }
+
+                override fun onCancel() {
+                    // Usually the user panning mid-animation. Treat the viewport
+                    // as settled rather than re-fitting over them on the next
+                    // fix; the re-centre button is there when they want it back.
+                    fitting.value = false
+                    locked.value = true
+                }
+            },
+        )
+    }
 
     Box(Modifier.fillMaxSize()) {
         AndroidView(
@@ -214,16 +248,14 @@ fun MapScreen() {
             val waitedTooLong =
                 SystemClock.elapsedRealtime() - (firstFixAt.value ?: 0L) >= PRECISION_WAIT_MS
 
-            if (!locked.value && (loc.accuracy <= Geo.PRECISE_ACCURACY_METERS || waitedTooLong)) {
-                locked.value = true
-                follow.value = true
-                m.animateCamera(
-                    CameraUpdateFactory.newLatLngBounds(
-                        Geo.boundsAround(loc.latitude, loc.longitude), 0
-                    ),
-                    800,
-                )
-            } else if (locked.value && follow.value) {
+            if (!locked.value && !fitting.value &&
+                (loc.accuracy <= Geo.PRECISE_ACCURACY_METERS || waitedTooLong)
+            ) {
+                fitTo(m, loc, 800)
+            } else if (locked.value && follow.value && !fitting.value) {
+                // Never while fitting: easing to a new centre cancels the bounds
+                // animation in flight and strands the camera at whatever zoom it
+                // had reached, which is how the 30 m viewport got lost.
                 m.easeCamera(
                     CameraUpdateFactory.newLatLng(LatLng(loc.latitude, loc.longitude)), 500
                 )
@@ -283,13 +315,7 @@ fun MapScreen() {
                         val loc = location
                         val m = map
                         if (loc != null && m != null) {
-                            follow.value = true
-                            m.animateCamera(
-                                CameraUpdateFactory.newLatLngBounds(
-                                    Geo.boundsAround(loc.latitude, loc.longitude), 0
-                                ),
-                                600,
-                            )
+                            fitTo(m, loc, 600)
                         }
                     },
                     modifier = Modifier
@@ -367,6 +393,27 @@ private fun rememberMapViewWithLifecycle(): MapView {
         onDispose { lifecycle.removeObserver(observer) }
     }
     return mapView
+}
+
+/**
+ * Reports how wide the viewport actually ended up, measured across the map's
+ * own projection rather than assumed from the camera update. A 30 m view is the
+ * premise of the app, and an interrupted animation widens it silently — there
+ * is nothing on screen that makes the difference between 30 m and 200 m obvious.
+ */
+private fun logViewportWidth(map: MapLibreMap, widthPx: Int, heightPx: Int) {
+    if (widthPx <= 0) return
+    val projection = map.projection
+    val y = heightPx / 2f
+    val left = projection.fromScreenLocation(PointF(0f, y))
+    val right = projection.fromScreenLocation(PointF(widthPx.toFloat(), y))
+    val meters = FloatArray(1)
+    Location.distanceBetween(left.latitude, left.longitude, right.latitude, right.longitude, meters)
+    Log.i(
+        TAG,
+        "viewport ≈ ${meters[0].roundToInt()} m wide " +
+            "(target ${Geo.VIEW_WIDTH_METERS.roundToInt()} m)",
+    )
 }
 
 private suspend fun startShare(
